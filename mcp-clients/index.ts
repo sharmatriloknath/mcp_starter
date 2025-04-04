@@ -1,6 +1,9 @@
-// huggingface sdk - use dynamic import
-import dotenv from "dotenv";
-import readline from "readline/promises";
+// Express server with HuggingFace MCP client
+import express from 'express';
+import type { Request, Response } from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import path from 'path';
 
 // mcp sdk
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -19,7 +22,7 @@ class MCPClient {
   private transport: StdioClientTransport | null = null;
   private tools: any[] = [];
   private model: string;
-  private messages: any[] = [];
+  private messages: Record<string, any[]> = {}; // Store message history by session ID
 
   constructor(model: string = "mistralai/Mixtral-8x7B-Instruct-v0.1") {
     this.mcp = new Client({ name: "mcp-client-cli", version: "1.0.0" });
@@ -29,8 +32,8 @@ class MCPClient {
   // Initialize Hugging Face client with dynamic import
   async initialize() {
     // Use dynamic import for ESM compatibility
-    const { HfInference } = await import("@huggingface/inference");
-    this.llm = new HfInference(HUGGINGFACE_API_KEY);
+    const hfModule = await import("@huggingface/inference");
+    this.llm = new hfModule.HfInference(HUGGINGFACE_API_KEY);
   }
 
   // Connect to the MCP
@@ -69,6 +72,13 @@ class MCPClient {
       "Connected to server with tools:",
       this.tools.map(({ name }) => name)
     );
+    
+    return this.tools;
+  }
+
+  // Get tools
+  getTools() {
+    return this.tools;
   }
 
   // Create a system prompt with tool descriptions
@@ -98,17 +108,22 @@ class MCPClient {
   }
 
   // Format chat history for HuggingFace model
-  private formatChatHistory() {
+  private formatChatHistory(sessionId: string) {
+    // Initialize session if it doesn't exist
+    if (!this.messages[sessionId]) {
+      this.messages[sessionId] = [];
+    }
+
     let formattedPrompt = "";
     
     // Add system message if there is no history yet
-    if (this.messages.length === 0) {
+    if (this.messages[sessionId].length === 0) {
       formattedPrompt += `<s>[INST] ${this.createSystemPrompt()} [/INST]</s>\n`;
     }
     
     // Add conversation history
-    for (let i = 0; i < this.messages.length; i++) {
-      const message = this.messages[i];
+    for (let i = 0; i < this.messages[sessionId].length; i++) {
+      const message = this.messages[sessionId][i];
       if (message.role === "user") {
         formattedPrompt += `<s>[INST] ${message.content} [/INST]`;
       } else if (message.role === "assistant") {
@@ -141,15 +156,20 @@ class MCPClient {
   }
 
   // Process query
-  async processQuery(query: string) {
+  async processQuery(query: string, sessionId: string = "default") {
+    // Initialize session if it doesn't exist
+    if (!this.messages[sessionId]) {
+      this.messages[sessionId] = [];
+    }
+
     // Add user message to history
-    this.messages.push({
+    this.messages[sessionId].push({
       role: "user",
       content: query
     });
     
     // Format chat history for the model
-    const prompt = this.formatChatHistory();
+    const prompt = this.formatChatHistory(sessionId);
     
     // Call the model
     const response = await this.llm.textGeneration({
@@ -183,13 +203,13 @@ class MCPClient {
         );
         
         // Add tool result to chat history
-        this.messages.push({
+        this.messages[sessionId].push({
           role: "user",
           content: `Tool result for ${toolCall.name}: ${JSON.stringify(toolResult)}`
         });
         
         // Get follow-up response from model
-        const followUpPrompt = this.formatChatHistory();
+        const followUpPrompt = this.formatChatHistory(sessionId);
         const followUpResponse = await this.llm.textGeneration({
           model: this.model,
           inputs: followUpPrompt,
@@ -205,7 +225,7 @@ class MCPClient {
     }
     
     // Add assistant response to history
-    this.messages.push({
+    this.messages[sessionId].push({
       role: "assistant",
       content: finalText
     });
@@ -213,50 +233,92 @@ class MCPClient {
     return finalText;
   }
 
-  async chatLoop() {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    try {
-      console.log("\nMCP Client with HuggingFace Started!");
-      console.log(`Using model: ${this.model}`);
-      console.log("Type your queries or 'quit' to exit.");
-
-      while (true) {
-        const message = await rl.question("\nQuery: ");
-        if (message.toLowerCase() === "quit") {
-          break;
-        }
-        const response = await this.processQuery(message);
-        console.log("\n" + response);
-      }
-    } finally {
-      rl.close();
-    }
-  }
-
   async cleanup() {
     await this.mcp.close();
   }
 }
 
+// Express server setup
+async function setupServer(serverScriptPath: string, model: string, port: number = 3000) {
+  const app = express();
+  
+  // Configure middleware
+  app.use(cors());
+  app.use(express.json());
+  
+  // Initialize MCP client
+  const mcpClient = new MCPClient(model);
+  await mcpClient.connectToServer(serverScriptPath);
+  
+  // Health endpoint - returns available tools
+  app.get('/health', (req: Request, res: Response) => {
+    const tools = mcpClient.getTools();
+    res.json({
+      status: 'healthy',
+      model: model,
+      tools: tools
+    });
+  });
+  
+  // Chat endpoint
+  app.post('/chat', (req: Request, res: Response, next: express.NextFunction) => {
+    (async () => {
+      try {
+        const { query, sessionId = 'default' } = req.body;
+        
+        if (!query) {
+          return res.status(400).json({ error: 'Query is required' });
+        }
+        
+        const response = await mcpClient.processQuery(query, sessionId);
+        res.json({
+          sessionId,
+          response
+        });
+      } catch (error: any) {
+        console.error('Error processing chat request:', error);
+        res.status(500).json({ 
+          error: 'Failed to process query',
+          details: error.message
+        });
+        next(error);
+      }
+    })();
+  });
+  
+  // Start server
+  const server = app.listen(port, () => {
+    console.log(`MCP Express Server running on port ${port}`);
+    console.log(`Health endpoint: http://localhost:${port}/health`);
+    console.log(`Chat endpoint: http://localhost:${port}/chat (POST)`);
+  });
+  
+  // Cleanup on exit
+  process.on('SIGINT', async () => {
+    console.log('Shutting down server...');
+    await mcpClient.cleanup();
+    process.exit(0);
+  });
+  
+  return app;
+}
+
+// Main function
 async function main() {
   if (process.argv.length < 3) {
-    console.log("Usage: node index.js <path_to_server_script> [huggingface_model]");
+    console.log("Usage: node server.js <path_to_server_script> [huggingface_model] [port]");
     return;
   }
   
+  const serverScriptPath = process.argv[2];
   const model = process.argv[3] || "mistralai/Mixtral-8x7B-Instruct-v0.1";
-  const mcpClient = new MCPClient(model);
+  const port = parseInt(process.argv[4]) || 3000;
   
   try {
-    await mcpClient.connectToServer(process.argv[2]);
-    await mcpClient.chatLoop();
-  } finally {
-    await mcpClient.cleanup();
-    process.exit(0);
+    await setupServer(serverScriptPath, model, port);
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
   }
 }
 
